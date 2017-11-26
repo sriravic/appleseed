@@ -93,6 +93,8 @@ auto_release_ptr<CurveObject> CurveObjectReader::read(
             return load_text_curve_file(search_paths, name, params);
         else if (extension == ".mitshair")
             return load_mitsuba_curve_file(search_paths, name, params);
+        else if (extension == ".hair")
+            return load_cyhair_curve_file(search_paths, name, params);
         else throw ExceptionUnsupportedFileFormat(filepath.c_str());
     }
 }
@@ -438,6 +440,11 @@ auto_release_ptr<CurveObject> CurveObjectReader::load_mitsuba_curve_file(
         pretty_time(stopwatch.get_seconds()).c_str());
 
     return object;
+}
+
+foundation::auto_release_ptr<CurveObject> CurveObjectReader::load_cyhair_curve_file(const foundation::SearchPaths & search_paths, const char * name, const ParamArray & params)
+{
+    return foundation::auto_release_ptr<CurveObject>();
 }
 
 }   // namespace renderer

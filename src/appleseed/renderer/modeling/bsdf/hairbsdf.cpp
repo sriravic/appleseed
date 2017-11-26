@@ -37,6 +37,7 @@
 
 // appleseed.foundation headers.
 #include "foundation/math/basis.h"
+#include "foundation/math/fresnel.h"
 #include "foundation/math/sampling/mappings.h"
 #include "foundation/math/scalar.h"
 #include "foundation/math/vector.h"
@@ -120,8 +121,32 @@ namespace renderer
             return sigma_a;
         }
 
+        // Utility function to create two random numbers from one random number
+        // Based of pbrtv3 implementation
+        static uint32_t compactBy1(uint32_t x)
+        {
+            // x = -f-e -d-c -b-a -9-8 -7-6 -5-4 -3-2 -1-0
+            x &= 0x55555555;
+            // x = --fe --dc --ba --98 --76 --54 --32 --10
+            x = (x ^ (x >> 1)) & 0x33333333;
+            // x = ---- fedc ---- ba98 ---- 7654 ---- 3210
+            x = (x ^ (x >> 2)) & 0x0f0f0f0f;
+            // x = ---- ---- fedc ba98 ---- ---- 7654 3210
+            x = (x ^ (x >> 4)) & 0x00ff00ff;
+            // x = ---- ---- ---- ---- fedc ba98 7654 3210
+            x = (x ^ (x >> 8)) & 0x0000ffff;
+            return x;
+        }
+
+        static Vector2f demuxFloat(float v1)
+        {
+            uint64_t temp = v1 * (1ull << 32);
+            uint32_t bits[2] = { compactBy1(temp), compactBy1(temp >> 1) };
+            return Vector2f(bits[0] / (1 << 16), bits[1] / (1 << 16));
+        }
+
         //
-        // Lambertian BRDF.
+        // Hair BSDF.
         //
 
         const char* Model = "hair_bsdf";
@@ -210,8 +235,6 @@ namespace renderer
                 // Compute longitudinal scattering
                 float Mp = this->Mp(cosThetaWi, cosThetaWo, sinThetaWi, sinThetaWo, v);
 
-
-
                 // Compute Attenuation
 
                 // Compute Azimuthal scattering
@@ -252,6 +275,8 @@ namespace renderer
         
         private:
 
+            static const int pMax = 3;      // number of modes within the bsdf we explicitly compute
+
             static float Mp(float cosThetaI, float cosThetaO, float sinThetaI, float sinThetaO, float v)
             {
                 float a = cosThetaI * cosThetaO;
@@ -280,6 +305,31 @@ namespace renderer
                 float T = exp(-sigma_a * l);
             }
 
+            static std::array<Spectrum, pMax + 1> Ap(float cosThetaO, float eta, float h, const Spectrum& T)
+            {
+                std::array<Spectrum, pMax + 1> ret;
+
+                // compute p0 - R
+                float cosGammaO = safeSqrt(1.0f - h * h);
+                float cosTheta = cosGammaO * cosThetaO;
+                float f;
+                fresnel_reflectance_dielectric(f, eta, cosTheta);
+                ret[0] = Spectrum(f);
+
+                // compute p1 - TT
+                ret[1] = Sqr(1.0 - f) * T;
+
+                // compute p2 - TRT
+                for (int i = 2; i < pMax; i++)
+                    ret[i] = ret[i - 1] * T * f;
+
+                // compute all other higher order bounces
+                ret[pMax] = ret[pMax - 1] * f * T / (Spectrum(1.0f) - T * f);
+
+                // return the values
+                return ret;
+            }
+
             static float I0(float x)
             {
 
@@ -289,8 +339,6 @@ namespace renderer
             {
 
             }
-
-            static const int pMax = 3;      // number of modes within the bsdf we explicitly compute
         };
 
         typedef BSDFWrapper<HairBSDFImpl> HairBSDF;
