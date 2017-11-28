@@ -60,6 +60,8 @@ namespace renderer
 
     namespace
     {
+        static const int pMax = 3;      // number of modes within the bsdf we explicitly compute
+
         //
         // Some temporary utility functions
         //
@@ -87,6 +89,97 @@ namespace renderer
         inline float safeSqrt(float val)
         {
             return std::sqrt(std::max(0.0f, val));
+        }
+
+        // Modified Bessel functions of the first kind
+        // I0(z) = \sum_{i = 0}^{infinity}{((1/4 * z^2)^i)/(i!)^2}
+        // I0(z) = \sum_{i = 0}^{infinity}{z^(2i) / (4^i * (i!)^2))}
+        // We use the first 10 terms
+        inline float I0(float x)
+        {
+            float val = 0;
+            float x2i = 1;
+            float ifact = 1;
+            int i4 = 1;
+            for (int i = 0; i < 10; i++)
+            {
+                if (i > 1) ifact *= i;
+                val += x2i / (i4 * Sqr(ifact));
+                x2i *= x * x;
+                i4 *= 4;
+            }
+            return val;
+        }
+
+        inline float LogI0(float x)
+        {
+            if (x > 12)
+                return x + 0.5f * (-std::log(2 * M_PI) + std::log(1 / x) + 1 / (8 * x));
+            else
+                return std::log(I0(x));
+        }
+
+        // function that computes the total angle difference
+        inline float Phi(int p, float gammaO, float gammaT)
+        {
+            return 2 * p * gammaT - 2 * gammaO + p * M_PI;
+        }
+
+        // Logistic function
+        inline float logistic(float x, float s)
+        {
+            x = std::abs(x);
+            return std::exp(-x / s) / (s * Sqr(1 + std::exp(-x / s)));
+        }
+
+        // integral of the logistic function
+        inline float logisticCDF(float x, float s)
+        {
+            return 1.0f / (1.0f + std::exp(-x / s));
+        }
+
+        // trimmed logistic
+        inline float trimmedLogistic(float x, float s, float lb, float ub)
+        {
+            assert(lb < ub, "the lower bound should be smaller than upper bound");
+            return logistic(x, s) / (logisticCDF(ub, s) - logisticCDF(lb, s));
+        }
+
+        // Absorption
+        static std::array<Spectrum, pMax + 1> Ap(float cosThetaO, float eta, float h, const Spectrum& T)
+        {
+            std::array<Spectrum, pMax + 1> ret;
+
+            // compute p0 - R
+            float cosGammaO = safeSqrt(1.0f - h * h);
+            float cosTheta = cosGammaO * cosThetaO;
+            float f;
+            fresnel_reflectance_dielectric(f, eta, cosTheta);
+            ret[0] = Spectrum(f);
+
+            // compute p1 - TT
+            ret[1] = Sqr(1.0 - f) * T;
+
+            // compute p2 - TRT
+            for (int i = 2; i < pMax; i++)
+                ret[i] = ret[i - 1] * T * f;
+
+            // compute all other higher order bounces
+            ret[pMax] = ret[pMax - 1] * f * T / (Spectrum(1.0f) - T * f);
+
+            // return the values
+            return ret;
+        }
+
+        // azimuthal scattering
+        inline float Np(float phi, int p, float s, float gammaO, float gammaT)
+        {
+            float dphi = phi - Phi(p, gammaO, gammaT);
+
+            // remap dphi to be within [-pi, pi]
+            while (dphi > M_PI) dphi -= 2 * M_PI;
+            while (dphi < -M_PI) dphi += 2 * M_PI;
+            return trimmedLogistic(dphi, s, -M_PI, M_PI);
         }
 
         // Utility functions to compute Absorption coefficient based on 
@@ -196,8 +289,8 @@ namespace renderer
 
                 // Compute the BRDF value.
                 const HairBSDFInputValues* values = static_cast<const HairBSDFInputValues*>(data);
-                sample.m_value.m_diffuse = values->m_reflectance;
-                sample.m_value.m_diffuse *= values->m_reflectance_multiplier * RcpPi<float>();
+                //sample.m_value.m_diffuse = values->m_reflectance;
+                //sample.m_value.m_diffuse *= values->m_reflectance_multiplier * RcpPi<float>();
                 sample.m_value.m_beauty = sample.m_value.m_diffuse;
 
                 // Compute the probability density of the sampled direction.
@@ -222,18 +315,13 @@ namespace renderer
                     return 0.0f;
 
                 // Compute geometric terms
-                float sinThetaWo = outgoing.x;
-                float cosThetaWo = safeSqrt(1.0f - Sqr(sinThetaWo));
-                float phiWo = std::atan2(outgoing.z, outgoing.y);
+                float sinThetaO = outgoing.x;
+                float cosThetaO = safeSqrt(1.0f - Sqr(sinThetaO));
+                float phiO = std::atan2(outgoing.z, outgoing.y);
 
-                float sinThetaWi = incoming.x;
-                float cosThetaWi = safeSqrt(1.0f - Sqr(sinThetaWi));
-                float phiWi = std::atan2(incoming.z, incoming.y);
-
-                float v = 0.0f;
-
-                // Compute longitudinal scattering
-                float Mp = this->Mp(cosThetaWi, cosThetaWo, sinThetaWi, sinThetaWo, v);
+                float sinThetaI = incoming.x;
+                float cosThetaI = safeSqrt(1.0f - Sqr(sinThetaI));
+                float phiI = std::atan2(incoming.z, incoming.y);
 
                 // Compute Attenuation
 
@@ -245,8 +333,8 @@ namespace renderer
 
                 // Compute the BRDF value.
                 const HairBSDFInputValues* values = static_cast<const HairBSDFInputValues*>(data);
-                value.m_diffuse = values->m_reflectance;
-                value.m_diffuse *= values->m_reflectance_multiplier * RcpPi<float>();
+                //value.m_diffuse = values->m_reflectance;
+                //value.m_diffuse *= values->m_reflectance_multiplier * RcpPi<float>();
                 value.m_beauty = value.m_diffuse;
 
                 // Return the probability density of the sampled direction.
@@ -274,9 +362,6 @@ namespace renderer
             }
         
         private:
-
-            static const int pMax = 3;      // number of modes within the bsdf we explicitly compute
-
             static float Mp(float cosThetaI, float cosThetaO, float sinThetaI, float sinThetaO, float v)
             {
                 float a = cosThetaI * cosThetaO;
@@ -304,41 +389,6 @@ namespace renderer
                 float sigma_a;
                 float T = exp(-sigma_a * l);
             }
-
-            static std::array<Spectrum, pMax + 1> Ap(float cosThetaO, float eta, float h, const Spectrum& T)
-            {
-                std::array<Spectrum, pMax + 1> ret;
-
-                // compute p0 - R
-                float cosGammaO = safeSqrt(1.0f - h * h);
-                float cosTheta = cosGammaO * cosThetaO;
-                float f;
-                fresnel_reflectance_dielectric(f, eta, cosTheta);
-                ret[0] = Spectrum(f);
-
-                // compute p1 - TT
-                ret[1] = Sqr(1.0 - f) * T;
-
-                // compute p2 - TRT
-                for (int i = 2; i < pMax; i++)
-                    ret[i] = ret[i - 1] * T * f;
-
-                // compute all other higher order bounces
-                ret[pMax] = ret[pMax - 1] * f * T / (Spectrum(1.0f) - T * f);
-
-                // return the values
-                return ret;
-            }
-
-            static float I0(float x)
-            {
-
-            }
-            
-            static float LogI0(float x)
-            {
-
-            }
         };
 
         typedef BSDFWrapper<HairBSDFImpl> HairBSDF;
@@ -346,7 +396,7 @@ namespace renderer
 
 
     //
-    // LambertianBRDFFactory class implementation.
+    // HairBSDFFactory class implementation.
     //
 
     void HairBSDFFactory::release()

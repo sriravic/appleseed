@@ -56,8 +56,6 @@ namespace renderer
 
     APPLESEED_DECLARE_INPUT_VALUES(HairBSDFInputValues)
     {
-        Spectrum    m_reflectance;              // diffuse reflectance (albedo, technically)
-        float       m_reflectance_multiplier;
         float       m_h;                        // offset along the curve width where the ray intersects the curve ribbon
         float       m_eta;                      // index of refraction inside the hair - typically 1.55
         Spectrum    m_sigmaA;                   // absorption coefficient inside the hair - distance is measured with respect to hair cylinder diameter
