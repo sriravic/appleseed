@@ -60,7 +60,8 @@ namespace renderer
 
     namespace
     {
-        static const int pMax = 3;      // number of modes within the bsdf we explicitly compute
+        static const int pMax = 3;                      // number of modes within the bsdf we explicitly compute
+        static const float SqrtPiOver8 = 0.626657069f;  // a value used in computations within the hairbsdf
 
         //
         // Some temporary utility functions
@@ -145,6 +146,17 @@ namespace renderer
             return logistic(x, s) / (logisticCDF(ub, s) - logisticCDF(lb, s));
         }
 
+        // longitudinal scattering
+        static float Mp(float cosThetaI, float cosThetaO, float sinThetaI, float sinThetaO, float v)
+        {
+            float a = cosThetaI * cosThetaO;
+            float b = sinThetaI * sinThetaO;
+            float mp = (v <= .1f) ?
+                (std::exp(LogI0(a) - b - (1.0f / v) + 0.6931f + std::log(1.0f / (2 * v)))) :
+                (std::exp(-b) * I0(a)) / (std::sinh(1.0f / v) * 2 * v);
+            return mp;
+        }
+
         // Absorption
         static std::array<Spectrum, pMax + 1> Ap(float cosThetaO, float eta, float h, const Spectrum& T)
         {
@@ -180,6 +192,16 @@ namespace renderer
             while (dphi > M_PI) dphi -= 2 * M_PI;
             while (dphi < -M_PI) dphi += 2 * M_PI;
             return trimmedLogistic(dphi, s, -M_PI, M_PI);
+        }
+
+        // utility function to compute fast transmission using exp
+        // without rays or anything - just plain distance
+        inline Spectrum Exp(const Spectrum& sigma_t, const float distance)
+        {
+            Spectrum ret;
+            for (int i = 0; i < sigma_t.Samples; i++)
+                ret[i] = std::exp(-sigma_t[i] * distance);
+            return ret;
         }
 
         // Utility functions to compute Absorption coefficient based on 
@@ -251,7 +273,7 @@ namespace renderer
             HairBSDFImpl(
                 const char*                 name,
                 const ParamArray&           params)
-                : BSDF(name, Reflective, ScatteringMode::Glossy | ScatteringMode::Specular, params)
+                : BSDF(name, AllBSDFTypes, ScatteringMode::Glossy, params)
             {
                 m_inputs.declare("reflectance", InputFormatSpectralReflectance);
                 m_inputs.declare("reflectance_multiplier", InputFormatFloat, "1.0");
@@ -311,36 +333,88 @@ namespace renderer
                 const int                   modes,
                 DirectShadingComponents&    value) const override
             {
+                // NOTE: What modes do we use here?
+                //       to check if we should return 0 or not.
                 if (!ScatteringMode::has_diffuse(modes))
                     return 0.0f;
+
+                // Compute the BRDF value.
+                const HairBSDFInputValues* values = static_cast<const HairBSDFInputValues*>(data);
 
                 // Compute geometric terms
                 float sinThetaO = outgoing.x;
                 float cosThetaO = safeSqrt(1.0f - Sqr(sinThetaO));
                 float phiO = std::atan2(outgoing.z, outgoing.y);
+                float gammaO = safeASin(values->m_h);
 
                 float sinThetaI = incoming.x;
                 float cosThetaI = safeSqrt(1.0f - Sqr(sinThetaI));
                 float phiI = std::atan2(incoming.z, incoming.y);
 
-                // Compute Attenuation
+                // compute terms for the refracted ray
+                float eta = values->m_eta;
+                float sinThetaT = sinThetaO / eta;
+                float cosThetaT = safeSqrt(1.0f - Sqr(sinThetaT));
 
-                // Compute Azimuthal scattering
+                // compute the modified refraction coefficient
+                // TODO: add the derivation here?
+                float etap = std::sqrt(Sqr(eta) - Sqr(sinThetaO)) / cosThetaO;
+                float sinGammaT = values->m_h / etap;
+                float cosGammaT = safeSqrt(1.0f - Sqr(sinGammaT));
+                float gammaT = safeASin(sinGammaT);
 
-                // Compute the final BSDF value
+                // Compute Attenuation for the single path through the hair cylinder
+                Spectrum T = Exp(values->m_sigmaA, 2 * cosGammaT / cosThetaT);
 
+                float phi = phiO - phiI;
+                std::array<Spectrum, pMax + 1> ap = Ap(cosThetaO, values->m_h, values->m_eta, T);
+                
+                // compute the additional terms required for evaluation
+                // longitudinal variance factor computed from beta_m
+                float v[4];
+                float s;
+                float sin2kAlpha[3], cos2kAlpha[3];
+                computeAdditionalFactors(values->m_betaM, values->m_betaN, values->m_alpha,
+                    v, s, sin2kAlpha, cos2kAlpha);
+                
+                Spectrum fsum;
+                // compute the contributions of all the scattering lobes
+                for (int p = 0; p < pMax; p++)
+                {
+                    float sinThetaIp, cosThetaIp;
+                    if (p == 0) {
+                        sinThetaIp = sinThetaI * cos2kAlpha[1] + cosThetaI * sin2kAlpha[1];
+                        cosThetaIp = cosThetaI * cos2kAlpha[1] - sinThetaI * sin2kAlpha[1];
+                    }
+                    else if (p == 1) {
+                        sinThetaIp = sinThetaI * cos2kAlpha[0] - cosThetaI * sin2kAlpha[0];
+                        cosThetaIp = cosThetaI * cos2kAlpha[0] + sinThetaI * sin2kAlpha[0];
+                    }
+                    else if (p == 2) {
+                        sinThetaIp = sinThetaI * cos2kAlpha[2] - cosThetaI * sin2kAlpha[2];
+                        cosThetaIp = cosThetaI * cos2kAlpha[2] + sinThetaI * sin2kAlpha[2];
+                    }
+                    else {
+                        sinThetaIp = sinThetaI;
+                        cosThetaIp = cosThetaI;
+                    }
 
+                    // bsdf = Mp * Ap * Np
+                    cosThetaIp = std::abs(cosThetaIp);
+                    fsum += Mp(cosThetaI, cosThetaO, sinThetaIp, sinThetaO, v[p]) * ap[p] * Np(phi, p, s, gammaO, gammaT);
+                }
 
-                // Compute the BRDF value.
-                const HairBSDFInputValues* values = static_cast<const HairBSDFInputValues*>(data);
-                //value.m_diffuse = values->m_reflectance;
-                //value.m_diffuse *= values->m_reflectance_multiplier * RcpPi<float>();
-                value.m_beauty = value.m_diffuse;
+                // compute the contributions from the rest of the bounces
+                fsum += Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, v[pMax]) * ap[pMax] / (2.0f * M_PI);
+
+                // fsum / absCosTheta(Wi)
+                fsum /= std::abs(incoming.z);
+
+                value.m_glossy = fsum;
+                value.m_beauty = fsum;
 
                 // Return the probability density of the sampled direction.
-                const Vector3f& n = shading_basis.get_normal();
-                const float cos_in = abs(dot(incoming, n));
-                return cos_in * RcpPi<float>();
+                return evaluate_pdf(data, adjoint, geometric_normal, shading_basis, outgoing, incoming, modes);
             }
 
             float evaluate_pdf(
@@ -362,32 +436,29 @@ namespace renderer
             }
         
         private:
-            static float Mp(float cosThetaI, float cosThetaO, float sinThetaI, float sinThetaO, float v)
+            
+            // compute the longitudinal variance and azimuthal logistic scale factor
+            void computeAdditionalFactors(float betaM, float betaN, float scaleAlpha, float* v, float& s, float* sin2kAlpha, float* cos2kAlpha) const
             {
-                float a = cosThetaI * cosThetaO;
-                float b = sinThetaI * sinThetaO;
-                float mp = (v <= .1f) ?
-                    (std::exp(LogI0(a) - b - (1.0f / v) + 0.6931f + std::log(1.0f / (2 * v)))) :
-                    (std::exp(-b) * I0(a)) / (std::sinh(1.0f / v) * 2 * v);
-                return mp;
-            }
+                // TODO: We need to find a logic to ask if we can compute the values for multiple lobes
+                // greater than pMax = 3
+                // even pbrtv3 asks this question
+                v[0] = Sqr(0.726f * betaM + 0.812f * Sqr(betaM) + 3.7f * Pow<20>(betaM));
+                v[1] = 0.25f * v[0];
+                v[2] = 4.0f * v[0];
+                v[3] = v[2];
 
-            static float Ap(float cosTheta0, float sinTheta0, float h, float eta)
-            {
-                float sinThetaT = sinTheta0 / eta;
-                float cosThetaT = safeSqrt(1.0f - Sqr(sinThetaT));
+                // azimuthal logistic scale factor
+                s = SqrtPiOver8 * (0.265f * betaN + 1.194f * Sqr(betaN) + 5.372f * Pow<22>(betaN));
 
-                float etap = std::sqrt(Sqr(eta) - Sqr(sinTheta0)) / cosTheta0;
-                float sinGammaT = h / etap;
-                float cosGammaT = safeSqrt(1.0f - Sqr(sinGammaT));
-                float gammaT = safeASin(sinGammaT);
-
-                // compute the distance of traverse within the hair
-                float l = 2 * cosGammaT / cosThetaT;
-
-                // TODO: compute this for all channels
-                float sigma_a;
-                float T = exp(-sigma_a * l);
+                // compute some sine and cosine terms that account for scale alpha terms
+                sin2kAlpha[0] = std::sin(deg_to_rad(scaleAlpha));
+                cos2kAlpha[0] = safeSqrt(1.0f - Sqr(sin2kAlpha[0]));
+                for (int i = 1; i < pMax; i++)
+                {
+                    sin2kAlpha[i] = 2.0f * cos2kAlpha[i - 1] * sin2kAlpha[i - 1];
+                    cos2kAlpha[i] = Sqr(cos2kAlpha[i - 1]) * Sqr(sin2kAlpha[i - 1]);
+                }
             }
         };
 
