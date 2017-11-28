@@ -46,6 +46,7 @@
 
 // Standard headers.
 #include <cmath>
+#include <numeric>
 
 // Forward declarations.
 namespace foundation { class IAbortSwitch; }
@@ -146,6 +147,13 @@ namespace renderer
             return logistic(x, s) / (logisticCDF(ub, s) - logisticCDF(lb, s));
         }
 
+        static float sampleTrimmedLogistic(float u, float s, float a, float b)
+        {
+            float k = logisticCDF(b, s) - logisticCDF(a, s);
+            float x = -s * std::log((1 / (u * k + logisticCDF(a, s))) - 1.0f);
+            return clamp(x, a, b);
+        }
+
         // longitudinal scattering
         static float Mp(float cosThetaI, float cosThetaO, float sinThetaI, float sinThetaO, float v)
         {
@@ -201,6 +209,20 @@ namespace renderer
             Spectrum ret;
             for (int i = 0; i < sigma_t.Samples; i++)
                 ret[i] = std::exp(-sigma_t[i] * distance);
+            return ret;
+        }
+
+        // method to compute a discrete pdf based on Ap
+        std::array<float, pMax + 1> computeApPdf(float cosThetaO, float eta, float h, const Spectrum& T)
+        {
+            std::array<float, pMax + 1> ret;
+            
+            float sinThetaO = safeSqrt(1.0f - Sqr(cosThetaO));
+            std::array<Spectrum, pMax + 1> retAp = Ap(cosThetaO, eta, h, T);
+
+            float sumY = std::accumulate(retAp.begin(), retAp.end(), float(0), [](float s, const Spectrum& ap) { return s + luminance(ap); });
+            for (int i = 0; i <= pMax; i++)
+                ret[i] = luminance(retAp[i]) / sumY;
             return ret;
         }
 
@@ -297,7 +319,7 @@ namespace renderer
                 const int                   modes,
                 BSDFSample&                 sample) const override
             {
-                if (!ScatteringMode::has_diffuse(modes))
+                if (!ScatteringMode::has_glossy(modes))
                     return;
 
                 // Set the scattering mode.
@@ -335,7 +357,7 @@ namespace renderer
             {
                 // NOTE: What modes do we use here?
                 //       to check if we should return 0 or not.
-                if (!ScatteringMode::has_diffuse(modes))
+                if (!ScatteringMode::has_glossy(modes))
                     return 0.0f;
 
                 // Compute the BRDF value.
@@ -426,7 +448,7 @@ namespace renderer
                 const Vector3f&             incoming,
                 const int                   modes) const override
             {
-                if (!ScatteringMode::has_diffuse(modes))
+                if (!ScatteringMode::has_glossy(modes))
                     return 0.0f;
 
                 // Return the probability density of the sampled direction.
@@ -438,6 +460,9 @@ namespace renderer
         private:
             
             // compute the longitudinal variance and azimuthal logistic scale factor
+            // v - longitudinal variance factor
+            // s - azimuthal logistic scale factor
+            // betaM - [0,1] -> v(0) - smooth / v(1) - rough
             void computeAdditionalFactors(float betaM, float betaN, float scaleAlpha, float* v, float& s, float* sin2kAlpha, float* cos2kAlpha) const
             {
                 // TODO: We need to find a logic to ask if we can compute the values for multiple lobes
@@ -446,7 +471,8 @@ namespace renderer
                 v[0] = Sqr(0.726f * betaM + 0.812f * Sqr(betaM) + 3.7f * Pow<20>(betaM));
                 v[1] = 0.25f * v[0];
                 v[2] = 4.0f * v[0];
-                v[3] = v[2];
+                for (int p = 3; p <= pMax; p++)
+                    v[p] = v[2];
 
                 // azimuthal logistic scale factor
                 s = SqrtPiOver8 * (0.265f * betaN + 1.194f * Sqr(betaN) + 5.372f * Pow<22>(betaN));
