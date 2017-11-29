@@ -226,6 +226,34 @@ namespace renderer
             return ret;
         }
 
+        // compute the longitudinal variance and azimuthal logistic scale factor
+        // v - longitudinal variance factor
+        // s - azimuthal logistic scale factor
+        // betaM - [0,1] -> v(0) - smooth / v(1) - rough
+        void computeAdditionalFactors(float betaM, float betaN, float scaleAlpha, float* v, float& s, float* sin2kAlpha, float* cos2kAlpha) const
+        {
+            // TODO: We need to find a logic to ask if we can compute the values for multiple lobes
+            // greater than pMax = 3
+            // even pbrtv3 asks this question
+            v[0] = Sqr(0.726f * betaM + 0.812f * Sqr(betaM) + 3.7f * Pow<20>(betaM));
+            v[1] = 0.25f * v[0];
+            v[2] = 4.0f * v[0];
+            for (int p = 3; p <= pMax; p++)
+                v[p] = v[2];
+
+            // azimuthal logistic scale factor
+            s = SqrtPiOver8 * (0.265f * betaN + 1.194f * Sqr(betaN) + 5.372f * Pow<22>(betaN));
+
+            // compute some sine and cosine terms that account for scale alpha terms
+            sin2kAlpha[0] = std::sin(deg_to_rad(scaleAlpha));
+            cos2kAlpha[0] = safeSqrt(1.0f - Sqr(sin2kAlpha[0]));
+            for (int i = 1; i < pMax; i++)
+            {
+                sin2kAlpha[i] = 2.0f * cos2kAlpha[i - 1] * sin2kAlpha[i - 1];
+                cos2kAlpha[i] = Sqr(cos2kAlpha[i - 1]) * Sqr(sin2kAlpha[i - 1]);
+            }
+        }
+
         // Utility functions to compute Absorption coefficient based on 
         // parameters
 
@@ -455,36 +483,6 @@ namespace renderer
                 const Vector3f& n = shading_basis.get_normal();
                 const float cos_in = abs(dot(incoming, n));
                 return cos_in * RcpPi<float>();
-            }
-        
-        private:
-            
-            // compute the longitudinal variance and azimuthal logistic scale factor
-            // v - longitudinal variance factor
-            // s - azimuthal logistic scale factor
-            // betaM - [0,1] -> v(0) - smooth / v(1) - rough
-            void computeAdditionalFactors(float betaM, float betaN, float scaleAlpha, float* v, float& s, float* sin2kAlpha, float* cos2kAlpha) const
-            {
-                // TODO: We need to find a logic to ask if we can compute the values for multiple lobes
-                // greater than pMax = 3
-                // even pbrtv3 asks this question
-                v[0] = Sqr(0.726f * betaM + 0.812f * Sqr(betaM) + 3.7f * Pow<20>(betaM));
-                v[1] = 0.25f * v[0];
-                v[2] = 4.0f * v[0];
-                for (int p = 3; p <= pMax; p++)
-                    v[p] = v[2];
-
-                // azimuthal logistic scale factor
-                s = SqrtPiOver8 * (0.265f * betaN + 1.194f * Sqr(betaN) + 5.372f * Pow<22>(betaN));
-
-                // compute some sine and cosine terms that account for scale alpha terms
-                sin2kAlpha[0] = std::sin(deg_to_rad(scaleAlpha));
-                cos2kAlpha[0] = safeSqrt(1.0f - Sqr(sin2kAlpha[0]));
-                for (int i = 1; i < pMax; i++)
-                {
-                    sin2kAlpha[i] = 2.0f * cos2kAlpha[i - 1] * sin2kAlpha[i - 1];
-                    cos2kAlpha[i] = Sqr(cos2kAlpha[i - 1]) * Sqr(sin2kAlpha[i - 1]);
-                }
             }
         };
 
