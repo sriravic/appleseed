@@ -213,7 +213,7 @@ namespace renderer
         }
 
         // method to compute a discrete pdf based on Ap
-        std::array<float, pMax + 1> computeApPdf(float cosThetaO, float eta, float h, const Spectrum& T)
+        std::array<float, pMax + 1> computeApPdf(float cosThetaO, float eta, float h)
         {
             std::array<float, pMax + 1> ret;
             
@@ -417,7 +417,8 @@ namespace renderer
                 Spectrum T = Exp(values->m_sigmaA, 2 * cosGammaT / cosThetaT);
 
                 float phi = phiO - phiI;
-                std::array<Spectrum, pMax + 1> ap = Ap(cosThetaO, values->m_h, values->m_eta, T);
+                std::array<Spectrum, pMax + 1> ap = Ap(cosThetaO, values->m_eta, values->m_h, T);
+                std::array<float, pMax + 1> apPdf = computeApPdf(cosThetaO, values->m_eta, values->m_h);
                 
                 // compute the additional terms required for evaluation
                 // longitudinal variance factor computed from beta_m
@@ -428,6 +429,7 @@ namespace renderer
                     v, s, sin2kAlpha, cos2kAlpha);
                 
                 Spectrum fsum;
+                float fpdf(0.f);
                 // compute the contributions of all the scattering lobes
                 for (int p = 0; p < pMax; p++)
                 {
@@ -452,10 +454,12 @@ namespace renderer
                     // bsdf = Mp * Ap * Np
                     cosThetaIp = std::abs(cosThetaIp);
                     fsum += Mp(cosThetaI, cosThetaO, sinThetaIp, sinThetaO, v[p]) * ap[p] * Np(phi, p, s, gammaO, gammaT);
+                    fpdf += Mp(cosThetaI, cosThetaO, sinThetaIp, sinThetaO, v[p]) * apPdf[p] * Np(phi, p, s, gammaO, gammaT);
                 }
 
                 // compute the contributions from the rest of the bounces
                 fsum += Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, v[pMax]) * ap[pMax] / (2.0f * M_PI);
+                fpdf += Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, v[pMax]) * apPdf[pMax] / (2.0f * M_PI);
 
                 // fsum / absCosTheta(Wi)
                 fsum /= std::abs(incoming.z);
@@ -464,7 +468,7 @@ namespace renderer
                 value.m_beauty = fsum;
 
                 // Return the probability density of the sampled direction.
-                return evaluate_pdf(data, adjoint, geometric_normal, shading_basis, outgoing, incoming, modes);
+                return fpdf;
             }
 
             float evaluate_pdf(
@@ -476,13 +480,76 @@ namespace renderer
                 const Vector3f&             incoming,
                 const int                   modes) const override
             {
+                // NOTE: What modes do we use here?
+                //       to check if we should return 0 or not.
                 if (!ScatteringMode::has_glossy(modes))
                     return 0.0f;
 
-                // Return the probability density of the sampled direction.
-                const Vector3f& n = shading_basis.get_normal();
-                const float cos_in = abs(dot(incoming, n));
-                return cos_in * RcpPi<float>();
+                // Compute the BRDF value.
+                const HairBSDFInputValues* values = static_cast<const HairBSDFInputValues*>(data);
+
+                // Compute geometric terms
+                float sinThetaO = outgoing.x;
+                float cosThetaO = safeSqrt(1.0f - Sqr(sinThetaO));
+                float phiO = std::atan2(outgoing.z, outgoing.y);
+                float gammaO = safeASin(values->m_h);
+
+                float sinThetaI = incoming.x;
+                float cosThetaI = safeSqrt(1.0f - Sqr(sinThetaI));
+                float phiI = std::atan2(incoming.z, incoming.y);
+
+                // compute terms for the refracted ray
+                float eta = values->m_eta;
+                float sinThetaT = sinThetaO / eta;
+                float cosThetaT = safeSqrt(1.0f - Sqr(sinThetaT));
+
+                // compute the modified refraction coefficient
+                // TODO: add the derivation here?
+                float etap = std::sqrt(Sqr(eta) - Sqr(sinThetaO)) / cosThetaO;
+                float sinGammaT = values->m_h / etap;
+                float cosGammaT = safeSqrt(1.0f - Sqr(sinGammaT));
+                float gammaT = safeASin(sinGammaT);
+
+                float phi = phiO - phiI;
+                std::array<float, pMax + 1> apPdf = computeApPdf(cosThetaO, values->m_eta, values->m_h);
+
+                // compute the additional terms required for evaluation
+                // longitudinal variance factor computed from beta_m
+                float v[4];
+                float s;
+                float sin2kAlpha[3], cos2kAlpha[3];
+                computeAdditionalFactors(values->m_betaM, values->m_betaN, values->m_alpha,
+                    v, s, sin2kAlpha, cos2kAlpha);
+
+                float fsum;
+                // compute the contributions of all the scattering lobes
+                for (int p = 0; p < pMax; p++)
+                {
+                    float sinThetaIp, cosThetaIp;
+                    if (p == 0) {
+                        sinThetaIp = sinThetaI * cos2kAlpha[1] + cosThetaI * sin2kAlpha[1];
+                        cosThetaIp = cosThetaI * cos2kAlpha[1] - sinThetaI * sin2kAlpha[1];
+                    }
+                    else if (p == 1) {
+                        sinThetaIp = sinThetaI * cos2kAlpha[0] - cosThetaI * sin2kAlpha[0];
+                        cosThetaIp = cosThetaI * cos2kAlpha[0] + sinThetaI * sin2kAlpha[0];
+                    }
+                    else if (p == 2) {
+                        sinThetaIp = sinThetaI * cos2kAlpha[2] - cosThetaI * sin2kAlpha[2];
+                        cosThetaIp = cosThetaI * cos2kAlpha[2] + sinThetaI * sin2kAlpha[2];
+                    }
+                    else {
+                        sinThetaIp = sinThetaI;
+                        cosThetaIp = cosThetaI;
+                    }
+
+                    cosThetaIp = std::abs(cosThetaIp);
+                    fsum += Mp(cosThetaI, cosThetaO, sinThetaIp, sinThetaO, v[p]) * apPdf[p] * Np(phi, p, s, gammaO, gammaT);
+                }
+
+                // compute the contributions from the rest of the bounces
+                fsum += Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, v[pMax]) * apPdf[pMax] / (2.0f * M_PI);
+                return fsum;
             }
         };
 
